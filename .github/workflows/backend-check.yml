@@ -1,0 +1,21 @@
+name: Backend syntax checks
+on:
+  push:
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-check.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify JavaScript syntax
+        run: node --check backend/server.js
+      - name: Verify package manifest
+        run: node -e "JSON.parse(require('node:fs').readFileSync('backend/package.json','utf8'))"
