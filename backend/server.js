@@ -24,6 +24,7 @@ const origin=new URL(process.env.PUBLIC_BASE_URL).origin;
 const allowed=['company','person','email','job','start','end','tasks','performance','conduct'];
 const clean=s=>typeof s==='string'?s.trim():'';
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
 async function api(url,opts){const r=await fetch(url,{...opts,signal:AbortSignal.timeout(45000)});if(!r.ok)throw Error('Remote API failed: '+r.status);return r;}
 app.get('/health',(req,res)=>res.json({ok:true}));
 app.post('/api/checkout',express.json({limit:'18kb'}),async(req,res)=>{
@@ -40,14 +41,19 @@ app.post('/api/checkout',express.json({limit:'18kb'}),async(req,res)=>{
 app.post('/api/stripe-webhook',express.raw({type:'application/json',limit:'1mb'}),async(req,res)=>{
  let event;
  try{event=stripe.webhooks.constructEvent(req.body,req.headers['stripe-signature'],process.env.STRIPE_WEBHOOK_SECRET);}catch{return res.status(400).send('Invalid signature');}
+ const client=await db.connect();
  try{
- await db.query('INSERT INTO stripe_events(id) VALUES($1) ON CONFLICT DO NOTHING',[event.id]);
- if(event.type==='checkout.session.completed'&&event.data.object.payment_status==='paid'){
- const s=event.data.object;
- await db.query("UPDATE orders SET state='paid',payment_intent=$2 WHERE id=$1 AND session_id=$3 AND state='created'",[s.client_reference_id,s.payment_intent,s.id]);
+ await client.query('BEGIN');
+ const inserted=await client.query('INSERT INTO stripe_events(id) VALUES($1) ON CONFLICT DO NOTHING RETURNING id',[event.id]);
+ if(inserted.rowCount&&event.type==='checkout.session.completed'&&event.data.object.payment_status==='paid'){
+ const session=event.data.object;
+ const updated=await client.query("UPDATE orders SET state='paid',payment_intent=$2 WHERE id=$1 AND session_id=$3 AND state='created' RETURNING id",[session.client_reference_id,session.payment_intent,session.id]);
+ if(!updated.rowCount)throw Error('Checkout session not yet matched to an order');
  }
+ await client.query('COMMIT');
  res.json({received:true});
- }catch(e){console.error('Webhook database error',e.message);res.status(503).send('Retry');}
+ }catch(e){await client.query('ROLLBACK');console.error('Webhook transaction failed',e.message);res.status(503).send('Retry');}
+ finally{client.release();}
 });
 const escape=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function generate(data){
@@ -73,8 +79,8 @@ async function work(){
  if(working)return;working=true;
  try{
  const {rows}=await db.query("UPDATE orders SET state='processing',locked_at=now(),attempts=attempts+1 WHERE id=(SELECT id FROM orders WHERE (state='paid' OR (state='retry' AND next_attempt<=now())) ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *");
- const o=rows[0];if(!o)return;
- try{
+ const o=rows[0];
+ if(o)try{
  const html=await generate(o.payload);const bytes=await pdf(html);
  await send(o.email,'Ihr Arbeitszeugnis-Entwurf','<p>Im Anhang finden Sie Ihren Arbeitszeugnis-Entwurf. Bitte vor Unterzeichnung prüfen.</p>',bytes);
  await db.query("UPDATE orders SET state='sent',payload=NULL,email=NULL,completed_at=now(),locked_at=NULL WHERE id=$1",[o.id]);
@@ -96,5 +102,13 @@ async function work(){
  }
  }catch(e){console.error('Worker error',e.message);}finally{working=false;}
 }
+// Reclaim interrupted jobs; attempts remain bounded by the retry logic.
+setInterval(async()=>{
+ try{
+ await db.query("UPDATE orders SET state=CASE WHEN attempts>=3 THEN 'refund_pending' ELSE 'retry' END, next_attempt=now(),locked_at=NULL WHERE state='processing' AND locked_at<now()-interval '4 minutes'");
+ await db.query("DELETE FROM orders WHERE state='created' AND created_at<now()-interval '24 hours'");
+ await db.query("DELETE FROM stripe_events WHERE created_at<now()-interval '30 days'");
+ }catch(e){console.error('Recovery or retention task failed',e.message);}
+},60000).unref();
 setInterval(()=>{work().catch(e=>console.error(e.message));},10000).unref();
 app.listen(process.env.PORT||3000,'0.0.0.0',()=>console.log('Backend listening'));
